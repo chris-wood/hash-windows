@@ -41,8 +41,8 @@ func (e channelError) Error() string {
 	return fmt.Sprintf("%s", e.prob)
 }
 
-func NewLossyChannel(lossProbability float64, timeoutInMs int, id int) *LossyChannel {
-	return &LossyChannel{make(chan interface{}), lossProbability, timeoutInMs * 1000000, id}
+func NewLossyChannel(dataSize int, lossProbability float64, timeoutInMs int, id int) *LossyChannel {
+	return &LossyChannel{make(chan interface{}, dataSize), lossProbability, timeoutInMs * 1000000, id}
 }
 
 func (c LossyChannel) Read() (interface{}, error) {
@@ -172,9 +172,7 @@ func contains(window []TagPair, tag TagPair) bool {
 	return false
 }
 
-func NewReceiver(windowSize int) *Receiver {
-	key := string(GenerateRandomBytes(32))
-
+func NewReceiver(windowSize int, key string) *Receiver {
 	firstTag := computeTag(0, key)
 
 	receiver := Receiver{
@@ -187,9 +185,11 @@ func NewReceiver(windowSize int) *Receiver {
 
 	// Inject the first tag into the window
 	receiver.tagWindow[firstTag] = 0
-	for i := 0; i <= windowSize; i++ {
+	for i := 0; i < windowSize; i++ {
 		receiver.IncreaseWindow()
 	}
+
+	log.Println("RECEIVER: initial window: ", receiver.tagWindow)
 
 	return &receiver
 }
@@ -201,6 +201,9 @@ func (t TagPair) Next(key string) TagPair {
 
 func (r *Receiver) AdvanceWindow() {
 	r.cumTag = r.cumTag.Next(r.key)
+	nextPair := r.upperTag.Next(r.key)
+	r.tagWindow[nextPair.tag] = nextPair.seq
+	r.upperTag = nextPair
 }
 
 func (r *Receiver) IncreaseWindow() {
@@ -211,11 +214,14 @@ func (r *Receiver) IncreaseWindow() {
 
 func (r *Receiver) Receive(tag string) (string, string) {
 	seq, ok := r.tagWindow[tag]
+
+	log.Println("RECEIVER: Received mesage", tag, r.tagWindow)
+
 	if !ok { // out of window, drop
-		log.Println("Out of window", tag)
+		log.Println("RECEIVER: Out of window", tag)
 		return r.cumTag.tag, r.cumTag.tag
 	} else if seq == r.cumTag.seq {
-		log.Println("In window and matches CACK", tag)
+		log.Println("RECEIVER: In window and matches CACK", tag)
 		// Advance the tag by one count
 		r.AdvanceWindow()
 
@@ -227,9 +233,10 @@ func (r *Receiver) Receive(tag string) (string, string) {
 			r.AdvanceWindow()
 		}
 
+		log.Println("RECEIVER: CACK is now", r.cumTag.seq)
 		return r.cumTag.tag, r.cumTag.tag
 	} else { // in window, but not the next expected one
-		log.Println("In window but != CACK", tag)
+		log.Println("RECEIVER: In window but != CACK", tag)
 		// Add the tag to the window
 		pair := TagPair{tag, seq}
 		r.window = append(r.window, pair)
@@ -249,6 +256,7 @@ func (r *Receiver) Run(inputChannel, outputChannel *LossyChannel) {
 		msg, err := inputChannel.Read()
 		if err == nil {
 			cack, sack := r.Receive(msg.(string))
+			log.Println("RECEIVER: Sending CACK", cack, "SACK", sack)
 			outputChannel.Write(ACK{cack, sack})
 		}
 	}
@@ -270,8 +278,7 @@ type Sender struct {
 	timer  *time.Timer
 }
 
-func NewSender(dataSize, windowSize int) *Sender {
-	key := string(GenerateRandomBytes(32))
+func NewSender(dataSize, windowSize int, key string) *Sender {
 	sender := Sender{
 		tagWindow:   make(map[string]uint32),
 		buffer:      make([]uint8, dataSize),
@@ -283,6 +290,14 @@ func NewSender(dataSize, windowSize int) *Sender {
 		rttVar:      float64(0.0),
 		rto:         float64(1000000),
 	}
+
+	// Initialize the sender window
+	for i := 0; i < windowSize; i++ {
+		tag := computeTag(uint32(i), sender.key)
+		sender.tagWindow[tag] = uint32(i)
+	}
+
+	log.Println("SENDER: initial window:", sender.tagWindow)
 
 	return &sender
 }
@@ -321,11 +336,14 @@ func (s *Sender) TagForSeq(seq uint32) string {
 
 func (s *Sender) HandleTimeout() {
 	<-s.timer.C
+	log.Println("SENDER: Timeout occurred")
 	// handle the timeout here...
 }
 
 func (s *Sender) Send(channel *LossyChannel) bool {
 	index := -1
+
+	log.Println("SENDER: Searching for next packet to send", len(s.flight), s.windowLower, s.windowUpper)
 	for i := s.windowLower; i < s.windowUpper; i++ {
 		if s.flight[i] == 0 && s.buffer[i] == 0 {
 			index = int(i)
@@ -343,6 +361,8 @@ func (s *Sender) Send(channel *LossyChannel) bool {
 	channel.Write(tag)
 	s.ResetTimer()
 
+	log.Println("SENDER: Sent packet", index)
+
 	return true
 }
 
@@ -350,7 +370,10 @@ func (s *Sender) AdvanceWindow() {
 	tag := computeTag(s.windowLower, s.key)
 	delete(s.tagWindow, tag)
 	s.windowLower++
-	s.windowUpper++
+
+	if int(s.windowUpper) < len(s.flight) {
+		s.windowUpper++
+	}
 	tag = computeTag(s.windowUpper, s.key)
 	s.tagWindow[tag] = s.windowUpper
 }
@@ -360,23 +383,39 @@ func (s *Sender) CalculateRTT(seq uint32) int64 {
 	return now - s.flight[seq]
 }
 
-func (s *Sender) Receive(channel *LossyChannel) {
+func (s *Sender) Receive(inputChannel, outputChannel *LossyChannel) {
 	for {
 		if s.windowLower == uint32(len(s.buffer)) {
 			break
 		}
 
-		msg, err := channel.Read() // this channel passes ACK structs
+		msg, err := inputChannel.Read() // this channel passes ACK structs
 		if err == nil {
-			seq, ok := s.tagWindow[msg.(string)]
+			ack := msg.(ACK)
+			sack := ack.sack
+			cack := ack.cack
+
+			log.Println("SENDER: Received response", cack, sack)
+
+			seq, ok := s.tagWindow[sack]
+			cackSeq, _ := s.tagWindow[cack]
+
 			if !ok {
+				log.Println("SENDER: injection detected")
 				// error! someone injected fake data
 			} else {
+				log.Println("SENDER: In window", seq)
 				s.buffer[seq] = 1 // ACK the packet
 				s.flight[seq] = 2 // Mark it as permanently in flight
-				if seq == s.windowLower {
+
+				// Advance the window forward to the CACK
+				for {
+					if s.windowLower == cackSeq {
+						break
+					}
+					log.Println("SENDER: advancing window")
 					s.AdvanceWindow()
-					s.Send(channel)
+					s.Send(outputChannel)
 				}
 
 				s.Acknowledge(seq)
@@ -385,13 +424,16 @@ func (s *Sender) Receive(channel *LossyChannel) {
 	}
 }
 
-func (s *Sender) Run(channel *LossyChannel) {
+func (s *Sender) Run(outputChannel *LossyChannel) {
 	for {
 		if s.windowLower == uint32(len(s.buffer)) {
+			log.Println("SENDER: Reached the end of the data")
 			s.timer.Stop()
 			break
-		} else if !s.Send(channel) {
-			break
+		}
+		ok := s.Send(outputChannel)
+		if !ok { // We can't send another packet, so just wait...
+			<-s.timer.C
 		}
 	}
 
@@ -434,17 +476,18 @@ func main() {
 			fmt.Println(ack, sack)
 		}
 	*/
-
-	outputStream := NewLossyChannel(0.00, 5, 1) // 1ms
-	inputStream := NewLossyChannel(0.00, 5, 1)  // 1ms
-
 	windowSize := 5
 	dataSize := 10
-	receiver := NewReceiver(windowSize)
-	sender := NewSender(windowSize, dataSize)
+	key := string(GenerateRandomBytes(32))
+
+	outputStream := NewLossyChannel(dataSize, 0.00, 5, 1) // 1ms
+	inputStream := NewLossyChannel(dataSize, 0.00, 5, 1)  // 1ms
+
+	receiver := NewReceiver(windowSize, key)
+	sender := NewSender(dataSize, windowSize, key)
 
 	go receiver.Run(outputStream, inputStream)
-	go sender.Receive(inputStream)
+	go sender.Receive(inputStream, outputStream)
 	sender.Run(outputStream)
 
 	/*
