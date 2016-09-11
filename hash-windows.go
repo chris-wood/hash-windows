@@ -1,11 +1,6 @@
 package main
 
 import "fmt"
-import "crypto/rand"
-import "crypto/hmac"
-import "crypto/sha256"
-import "encoding/binary"
-import "encoding/hex"
 import "time"
 import "log"
 import random "math/rand"
@@ -15,6 +10,21 @@ import "math"
 //import "log"
 //import "runtime"
 //import "github.com/pkg/profile"
+
+import "crypto/rand"
+import "crypto/hmac"
+import "crypto/sha256"
+import "encoding/binary"
+import "encoding/hex"
+
+func computeTag(in uint32, key string) string {
+	mac := hmac.New(sha256.New, []byte(key))
+	inContainer := make([]byte, 4)
+	binary.LittleEndian.PutUint32(inContainer, in)
+	mac.Write(inContainer)
+	output := mac.Sum(nil)
+	return hex.EncodeToString(output[0:4])
+}
 
 type LossyChannel struct {
 	channel         chan interface{}
@@ -110,15 +120,6 @@ func (s *HashState) AdvanceWindow() {
 		s.tagTable[topValue] = s.currentNum
 		s.currentNum++
 	}
-}
-
-func computeTag(in uint32, key string) string {
-	mac := hmac.New(sha256.New, []byte(key))
-	inContainer := make([]byte, 4)
-	binary.LittleEndian.PutUint32(inContainer, in)
-	mac.Write(inContainer)
-	output := mac.Sum(nil)
-	return hex.EncodeToString(output[0:4])
 }
 
 func slidingWindow(state *HashState, stream, out *LossyChannel) {
