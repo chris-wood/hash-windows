@@ -28,6 +28,7 @@ func computeTag(in uint32, key string) string {
 
 type LossyChannel struct {
 	channel         chan interface{}
+	channelIndex    int
 	lossProbability float64
 	timeout         int
 	id              int
@@ -42,7 +43,7 @@ func (e channelError) Error() string {
 }
 
 func NewLossyChannel(dataSize int, lossProbability float64, timeoutInMs int, id int) *LossyChannel {
-	return &LossyChannel{make(chan interface{}, dataSize), lossProbability, timeoutInMs * 1000000, id}
+	return &LossyChannel{make(chan interface{}, dataSize), 0, lossProbability, timeoutInMs * 1000000, id}
 }
 
 func (c LossyChannel) Read() (interface{}, error) {
@@ -63,91 +64,17 @@ func (c LossyChannel) Read() (interface{}, error) {
 }
 
 func (c LossyChannel) Write(v interface{}) {
-	c.channel <- v
-}
+	coinFlip := random.Float64()
 
-type HashState struct {
-	tagTable   map[string]uint32
-	currentNum uint32
-	lastNum    uint32
-	lastTag    string
-	key        string
+	if coinFlip >= c.lossProbability {
+		c.channel <- v
+	}
 }
 
 func GenerateRandomBytes(n int) []byte {
 	b := make([]byte, n)
 	rand.Read(b) // ignore errors...
 	return b
-}
-
-func NewHashState(n int) *HashState {
-	state := HashState{
-		tagTable:   make(map[string]uint32),
-		currentNum: 0,
-		lastNum:    0,
-		lastTag:    "",
-		key:        string(GenerateRandomBytes(32)),
-	}
-
-	state.lastTag = computeTag(state.lastNum, state.key)
-
-	for i := 0; i <= n; i++ {
-		state.IncreaseWindow()
-	}
-
-	return &state
-}
-
-func (s HashState) IsInWindow(tag string) bool {
-	_, ok := s.tagTable[tag]
-	return ok
-}
-
-func (s *HashState) IncreaseWindow() {
-	topValue := computeTag(s.currentNum, s.key)
-	s.tagTable[topValue] = s.currentNum
-	s.currentNum++
-}
-
-func (s *HashState) AdvanceWindow() {
-	bottomValue := computeTag(s.lastNum, s.key)
-	_, ok := s.tagTable[bottomValue]
-	if ok {
-		delete(s.tagTable, bottomValue)
-		s.lastNum++
-		s.lastTag = computeTag(s.lastNum, s.key)
-		topValue := computeTag(s.currentNum, s.key)
-		s.tagTable[topValue] = s.currentNum
-		s.currentNum++
-	}
-}
-
-func slidingWindow(state *HashState, stream, out *LossyChannel) {
-	for {
-		tagOut, err := stream.Read()
-		if err == nil {
-			start := time.Now()
-			flag := false
-			tag, _ := tagOut.(string)
-
-			if state.IsInWindow(tag) {
-				if tag == state.lastTag {
-					state.AdvanceWindow()
-				}
-				flag = true
-			}
-			elapsed := time.Since(start)
-
-			out.Write(PacketResult{flag, elapsed})
-		} else {
-			// pass
-		}
-	}
-}
-
-type PacketResult struct {
-	inWindow bool
-	elapsed  time.Duration
 }
 
 type TagPair struct {
@@ -215,7 +142,7 @@ func (r *Receiver) IncreaseWindow() {
 func (r *Receiver) Receive(tag string) (string, string) {
 	seq, ok := r.tagWindow[tag]
 
-	log.Println("RECEIVER: Received mesage", tag, r.tagWindow)
+	log.Println("RECEIVER: Received mesage", tag, seq, r.tagWindow)
 
 	if !ok { // out of window, drop
 		log.Println("RECEIVER: Out of window", tag)
@@ -234,7 +161,7 @@ func (r *Receiver) Receive(tag string) (string, string) {
 		}
 
 		log.Println("RECEIVER: CACK is now", r.cumTag.seq)
-		return r.cumTag.tag, r.cumTag.tag
+		return r.cumTag.tag, tag
 	} else { // in window, but not the next expected one
 		log.Println("RECEIVER: In window but != CACK", tag)
 		// Add the tag to the window
@@ -256,7 +183,9 @@ func (r *Receiver) Run(inputChannel, outputChannel *LossyChannel) {
 		msg, err := inputChannel.Read()
 		if err == nil {
 			cack, sack := r.Receive(msg.(string))
-			log.Println("RECEIVER: Sending CACK", cack, "SACK", sack)
+			cackSeq, _ := r.tagWindow[cack]
+			sackSeq, _ := r.tagWindow[sack]
+			log.Println("RECEIVER: Sending CACK", cack, cackSeq, "SACK", sack, sackSeq)
 			outputChannel.Write(ACK{cack, sack})
 		}
 	}
@@ -269,6 +198,8 @@ type Sender struct {
 	windowUpper uint32
 	windowLower uint32
 	key         string
+
+	sendSignal chan bool
 
 	// RTO state variables
 	// see: https://tools.ietf.org/html/rfc6298
@@ -286,6 +217,7 @@ func NewSender(dataSize, windowSize int, key string) *Sender {
 		windowUpper: uint32(windowSize - 1),
 		windowLower: uint32(0),
 		key:         key,
+		sendSignal:  make(chan bool),
 		srtt:        float64(0.0),
 		rttVar:      float64(0.0),
 		rto:         float64(1000000),
@@ -314,13 +246,18 @@ func (s *Sender) UpdateState(rtt float64) {
 		s.srtt = (1-alpha)*s.srtt + alpha*rtt
 	}
 	s.rto = s.srtt + (4 * s.rttVar)
+	log.Println("New RTO:", s.rto)
 }
 
 func (s *Sender) ResetTimer() {
 	if s.timer != nil {
 		s.timer.Stop()
+	} else {
+		s.timer = time.NewTimer(time.Duration(s.rto))
 	}
-	s.timer = time.NewTimer(time.Nanosecond * time.Duration(s.rto))
+
+	log.Println("SENDER: waiting for", s.rto, "ns")
+	s.timer.Reset(time.Nanosecond * time.Duration(s.rto))
 	go s.HandleTimeout()
 }
 
@@ -337,14 +274,22 @@ func (s *Sender) TagForSeq(seq uint32) string {
 func (s *Sender) HandleTimeout() {
 	<-s.timer.C
 	log.Println("SENDER: Timeout occurred")
-	// handle the timeout here...
+
+	// Reset the flight time of the last unacknowledged packet
+	for i := s.windowLower; i <= s.windowUpper; i++ {
+		if s.flight[i] != 0 && s.buffer[i] == 0 {
+			s.flight[i] = 0
+			break
+		}
+	}
+	s.sendSignal <- true
 }
 
 func (s *Sender) Send(channel *LossyChannel) bool {
 	index := -1
 
 	log.Println("SENDER: Searching for next packet to send", len(s.flight), s.windowLower, s.windowUpper)
-	for i := s.windowLower; i < s.windowUpper; i++ {
+	for i := s.windowLower; i <= s.windowUpper; i++ {
 		if s.flight[i] == 0 && s.buffer[i] == 0 {
 			index = int(i)
 			break
@@ -352,6 +297,7 @@ func (s *Sender) Send(channel *LossyChannel) bool {
 	}
 
 	if index == -1 {
+		log.Println("SENDER: No packets available to send")
 		return false
 	}
 
@@ -367,15 +313,17 @@ func (s *Sender) Send(channel *LossyChannel) bool {
 }
 
 func (s *Sender) AdvanceWindow() {
-	tag := computeTag(s.windowLower, s.key)
-	delete(s.tagWindow, tag)
-	s.windowLower++
-
-	if int(s.windowUpper) < len(s.flight) {
-		s.windowUpper++
+	if s.windowLower < s.windowUpper {
+		tag := computeTag(s.windowLower, s.key)
+		delete(s.tagWindow, tag)
+		s.windowLower++
 	}
-	tag = computeTag(s.windowUpper, s.key)
-	s.tagWindow[tag] = s.windowUpper
+
+	if int(s.windowUpper) < len(s.flight)-1 {
+		s.windowUpper++
+		tag := computeTag(s.windowUpper, s.key)
+		s.tagWindow[tag] = s.windowUpper
+	}
 }
 
 func (s *Sender) CalculateRTT(seq uint32) int64 {
@@ -385,7 +333,8 @@ func (s *Sender) CalculateRTT(seq uint32) int64 {
 
 func (s *Sender) Receive(inputChannel, outputChannel *LossyChannel) {
 	for {
-		if s.windowLower == uint32(len(s.buffer)) {
+		if s.windowLower == uint32(len(s.buffer))-1 {
+			log.Println("SENDER: Done receiving.")
 			break
 		}
 
@@ -400,13 +349,18 @@ func (s *Sender) Receive(inputChannel, outputChannel *LossyChannel) {
 			seq, ok := s.tagWindow[sack]
 			cackSeq, _ := s.tagWindow[cack]
 
+			// Short-circuit
+			if seq == uint32(len(s.buffer)) {
+				s.timer.Stop()
+				break
+			}
+
 			if !ok {
 				log.Println("SENDER: injection detected")
 				// error! someone injected fake data
 			} else {
 				log.Println("SENDER: In window", seq)
 				s.buffer[seq] = 1 // ACK the packet
-				s.flight[seq] = 2 // Mark it as permanently in flight
 
 				// Advance the window forward to the CACK
 				for {
@@ -415,7 +369,7 @@ func (s *Sender) Receive(inputChannel, outputChannel *LossyChannel) {
 					}
 					log.Println("SENDER: advancing window")
 					s.AdvanceWindow()
-					s.Send(outputChannel)
+					s.sendSignal <- true
 				}
 
 				s.Acknowledge(seq)
@@ -426,62 +380,33 @@ func (s *Sender) Receive(inputChannel, outputChannel *LossyChannel) {
 
 func (s *Sender) Run(outputChannel *LossyChannel) {
 	for {
-		if s.windowLower == uint32(len(s.buffer)) {
+		if s.windowLower == uint32(len(s.buffer))-1 {
 			log.Println("SENDER: Reached the end of the data")
 			s.timer.Stop()
 			break
 		}
+
 		ok := s.Send(outputChannel)
 		if !ok { // We can't send another packet, so just wait...
-			<-s.timer.C
+			select {
+			case <-s.sendSignal:
+				break
+			case <-s.timer.C:
+				break
+			}
 		}
 	}
 
 	fmt.Println("Done transferring data")
 }
 
-/*
-
-sender (of data):
-	packet: (seq number)
-	data:
-		- map from seq number to tag
-		- list of numbers to send (window that sends the first N of this list), ACKs advance window, SACKs remove entries from window
-
-receiver (of data):
-	packet: (ack number, SACK) (or not SACK, if just using cumulative ACK scheme)
-		- ACK number is ACK of last packet received
-		- SACK number is ACK of packet just received, not necessarily the LAST one received
-	data: minimum cumulative sequence received, and current window size
-
-*/
-
 func main() {
-	/*
-		receiver := NewReceiver(10)
-
-		for i := 1; i < 10; i++ {
-			tag := computeTag(uint32(i), receiver.key)
-			ack, sack := receiver.Receive(tag)
-			fmt.Println(ack, sack)
-		}
-
-		tag := computeTag(uint32(0), receiver.key)
-		ack, sack := receiver.Receive(tag)
-		fmt.Println(ack, sack)
-
-		for i := 4; i < 10; i++ {
-			tag := computeTag(uint32(i), receiver.key)
-			ack, sack := receiver.Receive(tag)
-			fmt.Println(ack, sack)
-		}
-	*/
 	windowSize := 5
 	dataSize := 10
 	key := string(GenerateRandomBytes(32))
 
-	outputStream := NewLossyChannel(dataSize, 0.00, 5, 1) // 1ms
-	inputStream := NewLossyChannel(dataSize, 0.00, 5, 1)  // 1ms
+	outputStream := NewLossyChannel(dataSize, 0.05, 5, 1) // 1ms
+	inputStream := NewLossyChannel(dataSize, 0.05, 5, 1)  // 1ms
 
 	receiver := NewReceiver(windowSize, key)
 	sender := NewSender(dataSize, windowSize, key)
@@ -489,54 +414,4 @@ func main() {
 	go receiver.Run(outputStream, inputStream)
 	go sender.Receive(inputStream, outputStream)
 	sender.Run(outputStream)
-
-	/*
-		state := NewHashState(10)                   // initial window size
-		outputStream := NewLossyChannel(0.05, 5, 1) // 1ms
-		inputStream := NewLossyChannel(0.00, 5, 1)  // 1ms
-
-		go slidingWindow(state, inputStream, outputStream)
-
-		for i := 0; i < 100; i++ {
-			tag := computeTag(uint32(i), state.key)
-			inputStream.Write(tag)
-
-			packetResult, err := outputStream.Read()
-			if err == nil {
-				result, _ := packetResult.(PacketResult)
-				if result.inWindow {
-					fmt.Printf("1 %d\n", result.elapsed)
-				} else {
-					fmt.Printf("0 %d\n", result.elapsed)
-				}
-			} else {
-				fmt.Println("Timeout", i)
-			}
-		}
-
-		for i := 0; i < 100; i++ {
-			tag := computeTag(uint32(i), state.key)
-			inputStream.Write(tag)
-
-			packetResult, err := outputStream.Read()
-			if err == nil {
-				result, _ := packetResult.(PacketResult)
-				if result.inWindow {
-					fmt.Printf("1 %d\n", result.elapsed)
-				} else {
-					fmt.Printf("0 %d\n", result.elapsed)
-				}
-			} else {
-				fmt.Println("Timeout", i)
-			}
-		}
-	*/
-
-	/*
-		runtime.GC() // get up-to-date statistics
-		if err := pprof.WriteHeapProfile(f); err != nil {
-			log.Fatal("could not write memory profile: ", err)
-		}
-		f.Close()
-	*/
 }
